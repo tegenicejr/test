@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Real 3D Dice Drop Demo</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <style>
+    :root {
+      --felt-bg: #143521;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    body {
+      width: 100vw;
+      height: 100vh;
+      background: radial-gradient(circle at center, #2e1509 0%, #110703 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      font-family: sans-serif;
+    }
+    .dice-tray {
+      width: 360px;
+      height: 280px;
+      background: var(--felt-bg);
+      border: 10px solid #3a1a0b;
+      border-radius: 16px;
+      box-shadow: inset 0 0 35px rgba(0,0,0,0.85), 0 12px 30px rgba(0,0,0,0.8);
+      position: relative;
+      overflow: hidden;
+      cursor: pointer;
+    }
+    #webgl-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .ui-area {
+      margin-top: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+    .roll-trigger-btn {
+      padding: 12px 36px;
+      background: linear-gradient(180deg, #e8ca74 0%, #b88628 100%);
+      color: #1a0b02;
+      font-size: 1.1rem;
+      font-weight: 900;
+      border: 1px solid #fff2b2;
+      border-radius: 10px;
+      cursor: pointer;
+      box-shadow: 0 4px 15px rgba(212,175,55,0.4);
+      transition: transform 0.1s;
+    }
+    .roll-trigger-btn:active {
+      transform: scale(0.96);
+    }
+    .result-label {
+      color: #f0ebd8;
+      font-size: 1rem;
+      font-weight: 700;
+      min-height: 24px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="dice-tray" id="tray">
+    <canvas id="webgl-canvas"></canvas>
+  </div>
+
+  <div class="ui-area">
+    <button class="roll-trigger-btn" id="roll-btn">サイコロを振る</button>
+    <div class="result-label" id="result-text">出目: - , -</div>
+  </div>
+
+  <script>
+    // Web Audio によるリアルな落下・バウンド打撃音
+    const AudioEngine = {
+      ctx: null,
+      init() {
+        if (!this.ctx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          this.ctx = new AC();
+        }
+        if (this.ctx.state === 'suspended') this.ctx.resume();
+      },
+      playHit(volume = 0.3, pitch = 140) {
+        this.init();
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(pitch + (Math.random() * 40 - 20), now);
+        osc.frequency.exponentialRampToValueAtTime(40, now + 0.05);
+
+        gain.gain.setValueAtTime(volume, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+
+        osc.start(now);
+        osc.stop(now + 0.05);
+      }
+    };
+
+    // --- テクスチャ生成（面の光の反射・テカりを完全排除したマット仕上げ） ---
+    function createDiceFaceTexture(val) {
+      const c = document.createElement('canvas');
+      c.width = 256;
+      c.height = 256;
+      const ctx = c.getContext('2d');
+
+      // 完全マットな清潔感ある白地（光沢グラデーションなし）
+      ctx.fillStyle = '#f8f8fa';
+      ctx.fillRect(0, 0, 256, 256);
+
+      // 角の微細なフチライン
+      ctx.strokeStyle = '#d2d5dc';
+      ctx.lineWidth = 12;
+      ctx.strokeRect(0, 0, 256, 256);
+
+      const isOne = (val === 1);
+      const pipRadius = isOne ? 44 : 23;
+      const pipColor = isOne ? '#e02418' : '#141517';
+
+      const pips = {
+        1: [[128, 128]],
+        2: [[68, 68], [188, 188]],
+        3: [[68, 68], [128, 128], [188, 188]],
+        4: [[68, 68], [188, 68], [68, 188], [188, 188]],
+        5: [[66, 66], [190, 66], [128, 128], [66, 190], [190, 190]],
+        6: [[68, 62], [188, 62], [68, 128], [188, 128], [68, 194], [188, 194]]
+      }[val];
+
+      pips.forEach(([x, y]) => {
+        ctx.beginPath();
+        ctx.arc(x, y, pipRadius, 0, Math.PI * 2);
+        ctx.fillStyle = pipColor;
+        ctx.fill();
+
+        // 目の中の彫り込み（落ち着いた立体感）
+        ctx.beginPath();
+        ctx.arc(x - pipRadius * 0.2, y - pipRadius * 0.2, pipRadius * 0.35, 0, Math.PI * 2);
+        ctx.fillStyle = isOne ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.15)';
+        ctx.fill();
+      });
+
+      return new THREE.CanvasTexture(c);
+    }
+
+    // 反射（スペキュラ）のないマットマテリアル
+    const materials = [
+      new THREE.MeshLambertMaterial({ map: createDiceFaceTexture(2) }),
+      new THREE.MeshLambertMaterial({ map: createDiceFaceTexture(5) }),
+      new THREE.MeshLambertMaterial({ map: createDiceFaceTexture(3) }),
+      new THREE.MeshLambertMaterial({ map: createDiceFaceTexture(4) }),
+      new THREE.MeshLambertMaterial({ map: createDiceFaceTexture(1) }),
+      new THREE.MeshLambertMaterial({ map: createDiceFaceTexture(6) })
+    ];
+
+    // 出目（1〜6）を手前正面に向ける回転角度
+    const FaceRotations = {
+      1: { x: 0, y: 0, z: 0 },
+      2: { x: 0, y: -Math.PI / 2, z: 0 },
+      3: { x: Math.PI / 2, y: 0, z: 0 },
+      4: { x: -Math.PI / 2, y: 0, z: 0 },
+      5: { x: 0, y: Math.PI / 2, z: 0 },
+      6: { x: 0, y: Math.PI, z: 0 }
+    };
+
+    // --- Three.js セットアップ ---
+    const canvas = document.getElementById('webgl-canvas');
+    const tray = document.getElementById('tray');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+    renderer.setSize(tray.clientWidth, tray.clientHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    const scene = new THREE.Scene();
+    
+    // 正面からの見やすいカメラ（パース角度35）
+    const camera = new THREE.PerspectiveCamera(35, tray.clientWidth / tray.clientHeight, 0.1, 100);
+    camera.position.set(0, 0, 7.8);
+    camera.lookAt(0, 0, 0);
+
+    // 均一で自然なアンビエント照明（不快なハイライト・反射なし）
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.95);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.45);
+    dirLight.position.set(2, 6, 8);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.width = 1024;
+    dirLight.shadow.mapSize.height = 1024;
+    scene.add(dirLight);
+
+    // 影用フロア
+    const floorGeo = new THREE.PlaneGeometry(15, 15);
+    const floorMat = new THREE.ShadowMaterial({ opacity: 0.45 });
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.position.set(0, 0, -0.6);
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // --- 本物の角丸立体ダイス（球体変形・面取り） ---
+    function createRoundedDiceGeometry(size = 1.15, radius = 0.16, segments = 6) {
+      const geo = new THREE.BoxGeometry(size, size, size, segments, segments, segments);
+      const pos = geo.attributes.position;
+      const half = size / 2;
+      const innerHalf = half - radius;
+
+      for (let i = 0; i < pos.count; i++) {
+        let x = pos.getX(i);
+        let y = pos.getY(i);
+        let z = pos.getZ(i);
+
+        let cx = Math.max(-innerHalf, Math.min(innerHalf, x));
+        let cy = Math.max(-innerHalf, Math.min(innerHalf, y));
+        let cz = Math.max(-innerHalf, Math.min(innerHalf, z));
+
+        let dx = x - cx;
+        let dy = y - cy;
+        let dz = z - cz;
+
+        let len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (len > 0) {
+          pos.setXYZ(i, cx + (dx / len) * radius, cy + (dy / len) * radius, cz + (dz / len) * radius);
+        }
+      }
+      geo.computeVertexNormals();
+      return geo;
+    }
+
+    const roundedGeo = createRoundedDiceGeometry(1.2, 0.18, 7);
+    const diceMesh1 = new THREE.Mesh(roundedGeo, materials);
+    const diceMesh2 = new THREE.Mesh(roundedGeo, materials);
+    diceMesh1.castShadow = true;
+    diceMesh2.castShadow = true;
+    scene.add(diceMesh1);
+    scene.add(diceMesh2);
+
+    // 初期位置（トレイ中央の左右）
+    diceMesh1.position.set(-1.05, 0, 0);
+    diceMesh2.position.set(1.05, 0, 0);
+
+    // --- 下コードの物理シミュレーションアルゴリズム完全移植 ---
+    function animatePhysicalDrop(mesh, targetX, targetValue, delay = 0, onComplete) {
+      setTimeout(() => {
+        const startTime = performance.now();
+        const duration = 950; // 全体時間（ms）
+        const startY = 4.2;   // 上空落下開始高さ
+
+        const targetRot = FaceRotations[targetValue];
+        // 空中回転（3〜4回転）
+        const extraSpinsX = (Math.floor(Math.random() * 2) + 3) * (Math.PI * 2);
+        const extraSpinsY = (Math.floor(Math.random() * 2) + 3) * (Math.PI * 2);
+        const totalRotX = extraSpinsX + targetRot.x;
+        const totalRotY = extraSpinsY + targetRot.y;
+
+        const driftX = (Math.random() - 0.5) * 0.45; // わずかな横ブレ
+
+        let soundBounced1 = false;
+        let soundBounced2 = false;
+
+        function frame(now) {
+          const elapsed = now - startTime;
+          const progress = Math.min(elapsed / duration, 1);
+
+          // 物理バウンド計算（下コードの減衰放物線ロジック）
+          let y = 0;
+          if (progress < 0.45) {
+            // 第1投球：上空から盤面への自由落下
+            const p = progress / 0.45;
+            y = startY * (1 - p * p);
+          } else if (progress < 0.75) {
+            // 第1バウンド：高く跳ね返る
+            if (!soundBounced1) {
+              AudioEngine.playHit(0.35, 170);
+              soundBounced1 = true;
+            }
+            const p = (progress - 0.45) / 0.3;
+            y = Math.sin(p * Math.PI) * 1.1;
+          } else if (progress < 0.92) {
+            // 第2バウンド：小さく跳ねる
+            if (!soundBounced2) {
+              AudioEngine.playHit(0.2, 220);
+              soundBounced2 = true;
+            }
+            const p = (progress - 0.75) / 0.17;
+            y = Math.sin(p * Math.PI) * 0.32;
+          } else {
+            // 最終静止
+            y = 0;
+          }
+
+          // イージング回転
+          const easeRot = 1 - Math.pow(1 - progress, 3);
+          const currentRotX = totalRotX * easeRot;
+          const currentRotY = totalRotY * easeRot;
+          const currentRotZ = Math.sin(progress * Math.PI) * 0.35;
+          const currentX = targetX + driftX * (1 - easeRot);
+
+          // メッシュ位置と回転を適用（Z=0を地面基準）
+          mesh.position.set(currentX, y, 0);
+          mesh.rotation.set(currentRotX, currentRotY, currentRotZ);
+
+          if (progress < 1) {
+            requestAnimationFrame(frame);
+          } else {
+            // 最終着地
+            AudioEngine.playHit(0.08, 260);
+            mesh.position.set(targetX, 0, 0);
+            // わずかな自然な停止傾き
+            const settleTilt = (targetX < 0 ? -1 : 1) * 0.08;
+            mesh.rotation.set(targetRot.x, targetRot.y, targetRot.z + settleTilt);
+            if (onComplete) onComplete();
+          }
+        }
+
+        requestAnimationFrame(frame);
+      }, delay);
+    }
+
+    let isRolling = false;
+
+    function renderLoop() {
+      requestAnimationFrame(renderLoop);
+      renderer.render(scene, camera);
+    }
+    renderLoop();
+
+    // ロール実行
+    function roll() {
+      if (isRolling) return;
+      isRolling = true;
+      document.getElementById('result-text').textContent = "振っています...";
+
+      const val1 = Math.floor(Math.random() * 6) + 1;
+      const val2 = Math.floor(Math.random() * 6) + 1;
+
+      let finishedCount = 0;
+      const checkDone = () => {
+        finishedCount++;
+        if (finishedCount === 2) {
+          isRolling = false;
+          document.getElementById('result-text').textContent = `出目: [ ${val1} ] , [ ${val2} ]`;
+        }
+      };
+
+      // 下コード同様、45msの時間差で落下・バウンド
+      animatePhysicalDrop(diceMesh1, -1.05, val1, 0, checkDone);
+      animatePhysicalDrop(diceMesh2, 1.05, val2, 45, checkDone);
+    }
+
+    document.getElementById('roll-btn').addEventListener('click', roll);
+    document.getElementById('tray').addEventListener('click', roll);
+  </script>
+</body>
+</html>
